@@ -193,6 +193,10 @@ export interface GateResult {
   /** When a group message is rejected due to missing bot mention, the
    *  caller should record this entry into the chat history map. */
   historyEntry?: HistoryEntry;
+  /** When threadFirstReplyWithoutMention is enabled and this is a non-first
+   *  message without mention, this is true. The caller should process the
+   *  message (for context) but skip the actual reply. */
+  skipReply?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -379,6 +383,9 @@ function checkGroupGate(params: {
         saveThreadState(); // Persist to file
         return { allowed: true };
       }
+      // Thread has been processed before, this is a non-first message without mention
+      // Allow it to pass for context, but mark to skip the reply
+      return { allowed: true, skipReply: true };
     }
 
     log(`feishu[${account.accountId}]: message in group ${ctx.chatId} did not mention bot, recording to history`);

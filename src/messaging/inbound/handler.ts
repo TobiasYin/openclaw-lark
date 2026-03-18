@@ -131,6 +131,26 @@ export async function handleFeishuMessage(params: {
     return;
   }
 
+  // 4b. Handle skipReply: record to history but don't dispatch to agent
+  // This is used for thread subsequent messages without mention when
+  // threadFirstReplyWithoutMention is enabled - AI sees context but doesn't reply.
+  if (gate.skipReply && chatHistories) {
+    const historyKey = threadScopedKey(ctx.chatId, ctx.threadId);
+    recordPendingHistoryEntryIfEnabled({
+      historyMap: chatHistories,
+      historyKey,
+      limit: historyLimit,
+      entry: {
+        sender: ctx.senderId,
+        body: `${ctx.senderName ?? ctx.senderId}: ${ctx.content}`,
+        timestamp: Date.now(),
+        messageId: ctx.messageId,
+      },
+    });
+    logger.info(`skipReply: recorded message to history but not dispatching to agent in thread ${ctx.threadId}`);
+    return;
+  }
+
   // 5. Batch pre-warm user name cache (sender + mentions)
   await prefetchUserNames({ ctx, account, log });
 
