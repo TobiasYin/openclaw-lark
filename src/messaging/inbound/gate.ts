@@ -17,7 +17,7 @@
  *     - `groupPolicy: "disabled"` → all groups blocked
  *
  *   Layer 2 – Which SENDERS are allowed within a group:
- *     - Per-group `groupPolicy` overrides global for sender filtering
+ *     - Per-group `groupPolicy` overrides the global groupPolicy for sender filtering
  *     - `groupAllowFrom` (global) + per-group `allowFrom` are merged
  *     - `"open"` → any sender; `"allowlist"` → check merged list;
  *       `"disabled"` → block all senders
@@ -37,6 +37,7 @@ import {
 } from './policy';
 import { mentionedBot } from './mention';
 import { sendPairingReply } from './gate-effects';
+import { threadScopedKey } from '../../channel/chat-queue';
 
 /** Prevent spamming the legacy groupAllowFrom migration warning. */
 let legacyGroupAllowFromWarned = false;
@@ -93,12 +94,14 @@ export async function checkMessageGate(params: {
   /** account 级别的 ClawdbotConfig（channels.feishu 已替换为 per-account 合并后的配置） */
   accountScopedCfg?: ClawdbotConfig;
   log: (...args: unknown[]) => void;
+  /** Chat histories map for thread first-message detection */
+  chatHistories?: Map<string, HistoryEntry[]>;
 }): Promise<GateResult> {
-  const { ctx, accountFeishuCfg, account, accountScopedCfg, log } = params;
+  const { ctx, accountFeishuCfg, account, accountScopedCfg, log, chatHistories } = params;
   const isGroup = ctx.chatType === 'group';
 
   if (isGroup) {
-    return checkGroupGate({ ctx, accountFeishuCfg, account, accountScopedCfg, log });
+    return checkGroupGate({ ctx, accountFeishuCfg, account, accountScopedCfg, log, chatHistories });
   }
 
   return checkDmGate({ ctx, accountFeishuCfg, account, accountScopedCfg, log });
@@ -114,8 +117,9 @@ function checkGroupGate(params: {
   account: LarkAccount;
   accountScopedCfg?: ClawdbotConfig;
   log: (...args: unknown[]) => void;
+  chatHistories?: Map<string, HistoryEntry[]>;
 }): GateResult {
-  const { ctx, accountFeishuCfg, account, accountScopedCfg, log } = params;
+  const { ctx, accountFeishuCfg, account, accountScopedCfg, log, chatHistories } = params;
   const core = LarkClient.runtime;
 
   // ---- Legacy compat: groupAllowFrom with chat_id entries ----
@@ -223,7 +227,29 @@ function checkGroupGate(params: {
     requireMentionOverride: accountFeishuCfg?.requireMention,
   });
 
+  // MODIFIED: Thread first-message auto-reply support
+  // If requireMention is true and bot is not mentioned, check if this is
+  // the first message in a thread and threadFirstReplyWithoutMention is enabled.
+  // If so, allow it to pass for auto-reply.
   if (requireMention && !mentionedBot(ctx)) {
+    // Check if threadFirstReplyWithoutMention is enabled for this group
+    const threadFirstReplyWithoutMention =
+      groupConfig?.threadFirstReplyWithoutMention ??
+      defaultConfig?.threadFirstReplyWithoutMention ??
+      accountFeishuCfg?.threadFirstReplyWithoutMention ??
+      false;
+
+    // Check if this is a thread message and chatHistories is available
+    if (threadFirstReplyWithoutMention && ctx.threadId && chatHistories) {
+      const historyKey = threadScopedKey(ctx.chatId, ctx.threadId);
+      const history = chatHistories.get(historyKey);
+      // If no history exists, this is the first message in the thread
+      if (!history || history.length === 0) {
+        log(`feishu[${account.accountId}]: first message in thread ${ctx.threadId}, auto-replying without mention (threadFirstReplyWithoutMention enabled)`);
+        return { allowed: true };
+      }
+    }
+
     log(`feishu[${account.accountId}]: message in group ${ctx.chatId} did not mention bot, recording to history`);
 
     return {
