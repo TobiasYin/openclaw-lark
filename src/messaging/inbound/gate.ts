@@ -23,6 +23,8 @@
  *       `"disabled"` → block all senders
  */
 
+import * as fs from 'fs';
+import * as path from 'path';
 import type { ClawdbotConfig, HistoryEntry } from 'openclaw/plugin-sdk';
 import type { MessageContext } from '../types';
 import type { FeishuConfig } from '../../core/types';
@@ -37,10 +39,134 @@ import {
 } from './policy';
 import { mentionedBot } from './mention';
 import { sendPairingReply } from './gate-effects';
-import { threadScopedKey } from '../../channel/chat-queue';
 
 /** Prevent spamming the legacy groupAllowFrom migration warning. */
 let legacyGroupAllowFromWarned = false;
+
+// ---------------------------------------------------------------------------
+// Thread first-message persistence
+// ---------------------------------------------------------------------------
+
+/** Thread state with timestamp for TTL eviction */
+const threadFirstMessageProcessed = new Map<string, number>(); // threadKey -> timestamp
+let threadStateLoaded = false;
+
+/** Persistence configuration defaults */
+const DEFAULT_TTL_DAYS = 7;
+const DEFAULT_MAX_ENTRIES = 10000;
+const THREAD_STATE_FILE = path.join(process.env.HOME || '/tmp', '.openclaw', 'thread-first-message-state.json');
+
+/** File lock for concurrent access */
+let isSaving = false;
+let pendingSave = false;
+
+/** Load persisted state on startup with TTL eviction */
+function loadThreadState(cfg?: FeishuConfig): void {
+  try {
+    if (fs.existsSync(THREAD_STATE_FILE)) {
+      const data = JSON.parse(fs.readFileSync(THREAD_STATE_FILE, 'utf8')) as {
+        threads?: Array<{ key: string; ts: number } | string>;
+        updatedAt?: string;
+      };
+      const persistenceCfg = cfg?.threadFirstReplyPersistence;
+      const ttlDays = persistenceCfg?.ttlDays ?? DEFAULT_TTL_DAYS;
+      const ttlMs = ttlDays * 24 * 60 * 60 * 1000;
+      const now = Date.now();
+
+      if (data.threads && Array.isArray(data.threads)) {
+        let loaded = 0;
+        let evicted = 0;
+
+        for (const entry of data.threads) {
+          // Support both old format (string) and new format (object with timestamp)
+          if (typeof entry === 'string') {
+            threadFirstMessageProcessed.set(entry, now);
+            loaded++;
+          } else if (entry.key && entry.ts) {
+            const age = now - entry.ts;
+            if (age < ttlMs) {
+              threadFirstMessageProcessed.set(entry.key, entry.ts);
+              loaded++;
+            } else {
+              evicted++;
+            }
+          }
+        }
+
+        if (evicted > 0) {
+          console.log(`[feishu] Loaded ${loaded} thread states, evicted ${evicted} expired entries (TTL: ${ttlDays} days)`);
+          queueSaveThreadState();
+        } else {
+          console.log(`[feishu] Loaded ${loaded} thread states from ${THREAD_STATE_FILE}`);
+        }
+      }
+    }
+  } catch (err) {
+    console.error(`[feishu] Failed to load thread state: ${(err as Error).message}`);
+  }
+}
+
+/** Queue save with debouncing to handle concurrent writes */
+function queueSaveThreadState(): void {
+  if (isSaving) {
+    pendingSave = true;
+    return;
+  }
+
+  isSaving = true;
+  pendingSave = false;
+
+  try {
+    doSaveThreadState();
+  } finally {
+    isSaving = false;
+    if (pendingSave) {
+      setTimeout(() => queueSaveThreadState(), 100);
+    }
+  }
+}
+
+/** Actual save implementation with eviction */
+function doSaveThreadState(): void {
+  try {
+    const dir = path.dirname(THREAD_STATE_FILE);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+
+    // Get all entries sorted by timestamp (oldest first)
+    const entries = Array.from(threadFirstMessageProcessed.entries())
+      .map(([key, ts]) => ({ key, ts }))
+      .sort((a, b) => a.ts - b.ts);
+
+    // Apply max entries limit (remove oldest)
+    const maxEntries = DEFAULT_MAX_ENTRIES;
+    if (entries.length > maxEntries) {
+      const toRemove = entries.length - maxEntries;
+      for (let i = 0; i < toRemove; i++) {
+        threadFirstMessageProcessed.delete(entries[i].key);
+      }
+      console.log(`[feishu] Evicted ${toRemove} oldest thread entries (max: ${maxEntries})`);
+    }
+
+    const data = {
+      threads: Array.from(threadFirstMessageProcessed.entries()).map(([key, ts]) => ({ key, ts })),
+      updatedAt: new Date().toISOString(),
+    };
+
+    // Atomic write: write to temp file then rename
+    const tempFile = `${THREAD_STATE_FILE}.tmp`;
+    fs.writeFileSync(tempFile, JSON.stringify(data, null, 2));
+    fs.renameSync(tempFile, THREAD_STATE_FILE);
+  } catch (err) {
+    console.error(`[feishu] Failed to save thread state: ${(err as Error).message}`);
+  }
+}
+
+/** Save state to file (public API) */
+function saveThreadState(): void {
+  queueSaveThreadState();
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -94,14 +220,20 @@ export async function checkMessageGate(params: {
   /** account 级别的 ClawdbotConfig（channels.feishu 已替换为 per-account 合并后的配置） */
   accountScopedCfg?: ClawdbotConfig;
   log: (...args: unknown[]) => void;
-  /** Chat histories map for thread first-message detection */
+  /** Chat histories map (kept for API compatibility but not used for thread tracking) */
   chatHistories?: Map<string, HistoryEntry[]>;
 }): Promise<GateResult> {
-  const { ctx, accountFeishuCfg, account, accountScopedCfg, log, chatHistories } = params;
+  const { ctx, accountFeishuCfg, account, accountScopedCfg, log } = params;
   const isGroup = ctx.chatType === 'group';
 
+  // Lazy load thread state with config when first message arrives
+  if (!threadStateLoaded && accountFeishuCfg) {
+    threadStateLoaded = true;
+    loadThreadState(accountFeishuCfg);
+  }
+
   if (isGroup) {
-    return checkGroupGate({ ctx, accountFeishuCfg, account, accountScopedCfg, log, chatHistories });
+    return checkGroupGate({ ctx, accountFeishuCfg, account, accountScopedCfg, log });
   }
 
   return checkDmGate({ ctx, accountFeishuCfg, account, accountScopedCfg, log });
@@ -117,9 +249,8 @@ function checkGroupGate(params: {
   account: LarkAccount;
   accountScopedCfg?: ClawdbotConfig;
   log: (...args: unknown[]) => void;
-  chatHistories?: Map<string, HistoryEntry[]>;
 }): GateResult {
-  const { ctx, accountFeishuCfg, account, accountScopedCfg, log, chatHistories } = params;
+  const { ctx, accountFeishuCfg, account, accountScopedCfg, log } = params;
   const core = LarkClient.runtime;
 
   // ---- Legacy compat: groupAllowFrom with chat_id entries ----
@@ -227,10 +358,9 @@ function checkGroupGate(params: {
     requireMentionOverride: accountFeishuCfg?.requireMention,
   });
 
-  // MODIFIED: Thread first-message auto-reply support
+  // Thread first-message auto-reply support
   // If requireMention is true and bot is not mentioned, check if this is
   // the first message in a thread and threadFirstReplyWithoutMention is enabled.
-  // If so, allow it to pass for auto-reply.
   if (requireMention && !mentionedBot(ctx)) {
     // Check if threadFirstReplyWithoutMention is enabled for this group
     const threadFirstReplyWithoutMention =
@@ -239,13 +369,14 @@ function checkGroupGate(params: {
       accountFeishuCfg?.threadFirstReplyWithoutMention ??
       false;
 
-    // Check if this is a thread message and chatHistories is available
-    if (threadFirstReplyWithoutMention && ctx.threadId && chatHistories) {
-      const historyKey = threadScopedKey(ctx.chatId, ctx.threadId);
-      const history = chatHistories.get(historyKey);
-      // If no history exists, this is the first message in the thread
-      if (!history || history.length === 0) {
-        log(`feishu[${account.accountId}]: first message in thread ${ctx.threadId}, auto-replying without mention (threadFirstReplyWithoutMention enabled)`);
+    // Check if this is a thread message
+    if (threadFirstReplyWithoutMention && ctx.threadId) {
+      const threadKey = `${ctx.chatId}:thread:${ctx.threadId}`;
+      // If this thread hasn't been processed yet, allow the first message
+      if (!threadFirstMessageProcessed.has(threadKey)) {
+        // Mark this thread as processed with current timestamp
+        threadFirstMessageProcessed.set(threadKey, Date.now());
+        saveThreadState(); // Persist to file
         return { allowed: true };
       }
     }

@@ -168,6 +168,15 @@ export const FeishuAccountConfigSchema = z.object({
   /** When true, the first message in a thread/topic will be replied to even without mention,
    *  even if requireMention is enabled. Subsequent messages still require mention. */
   threadFirstReplyWithoutMention: z.boolean().optional(),
+  /** Configuration for thread first reply persistence to survive Gateway restarts. */
+  threadFirstReplyPersistence: z.object({
+    /** Enable persistence to file (default: true when threadFirstReplyWithoutMention is enabled). */
+    enabled: z.boolean().optional(),
+    /** Maximum days to retain thread state before eviction (default: 7 days). */
+    ttlDays: z.number().optional(),
+    /** Maximum number of thread entries to retain (default: 10000). */
+    maxEntries: z.number().optional(),
+  }).optional(),
   groups: z.record(z.string(), FeishuGroupSchema).optional(),
   historyLimit: z.number().optional(),
   dmHistoryLimit: z.number().optional(),

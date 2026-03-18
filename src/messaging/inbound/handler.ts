@@ -111,10 +111,9 @@ export async function handleFeishuMessage(params: {
   );
 
   // 4. Gate: policy / access-control checks (skipped for synthetic messages)
-  // Pass chatHistories to enable thread first-message auto-reply detection
   const gate = forceMention
     ? ({ allowed: true } as GateResult)
-    : await checkMessageGate({ ctx, accountFeishuCfg, account, accountScopedCfg, log, chatHistories });
+    : await checkMessageGate({ ctx, accountFeishuCfg, account, accountScopedCfg, log });
   if (!gate.allowed) {
     if (gate.reason === 'no_mention') {
       logger.info(`rejected: no bot mention in group ${ctx.chatId}`);
